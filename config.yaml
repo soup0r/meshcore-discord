@@ -1,0 +1,25 @@
+# MeshCore to Discord Bridge Configuration
+
+meshcore:
+  # Your MeshCore WiFi node connection details
+  host: "192.168.1.100"          # IP address of your MeshCore node
+  port: 4000                      # TCP port (common: 4000, 4403, or 12345)
+  auto_reconnect: true            # Automatically reconnect on disconnect
+  reconnect_delay: 5              # Seconds to wait before reconnection
+
+discord:
+  # Discord bot token (get from https://discord.com/developers/applications)
+  token: "YOUR_BOT_TOKEN_HERE"
+  
+  # Discord channel IDs (right-click channel with Developer Mode enabled)
+  channels:
+    messages: 1234567890123456    # Channel ID for #meshcore-messages
+    info: 1234567890123456        # Channel ID for #meshcore-info
+  
+  # Rate limiting settings
+  batch_interval: 2.0             # Send batched messages every N seconds
+  max_batch_size: 10              # Maximum messages per batch
+
+logging:
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  file: "meshcore_discord.log"    # Log file path
