@@ -2,19 +2,29 @@
 
 meshcore:
   # Your MeshCore WiFi node connection details
-  host: "192.168.1.100"          # IP address of your MeshCore node
-  port: 4000                      # TCP port (common: 4000, 4403, or 12345)
+  host: "10.0.0.10"          # IP address of your MeshCore node
+  port: 5000                      # TCP port (common: 4000, 4403, or 12345)
   auto_reconnect: true            # Automatically reconnect on disconnect
-  reconnect_delay: 5              # Seconds to wait before reconnection
+  reconnect_delay: 30              # Seconds to wait before reconnection
 
 discord:
   # Discord bot token (get from https://discord.com/developers/applications)
-  token: "YOUR_BOT_TOKEN_HERE"
+  token: "<Discord Token>"
   
   # Discord channel IDs (right-click channel with Developer Mode enabled)
   channels:
-    messages: 1234567890123456    # Channel ID for #meshcore-messages
-    info: 1234567890123456        # Channel ID for #meshcore-info
+    # Direct messages go here
+    dm: 1234567890123456789          # Channel ID for #meshcore-dm
+    
+    # MeshCore channel routing (channel number -> Discord channel ID)
+    # These correspond to the channel numbers in your mesh network
+    channel_0: 1234567890123456789   # Channel ID for #meshcore-public (channel 0)
+    channel_1: 1234567890123456789   # Channel ID for #meshcore-norniron (channel 1)
+    channel_2: 1234567890123456789   # Channel ID for #test (channel 2)
+    channel_3: 1234567890123456789   # Channel ID for #cumbria (channel 3)
+    
+    # Everything else (mesh packets, adverts, ACKs, etc)
+    info: 1234567890123456789        # Channel ID for #meshcore-info
   
   # Rate limiting settings
   batch_interval: 2.0             # Send batched messages every N seconds

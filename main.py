@@ -50,6 +50,17 @@ class MeshCoreDiscordBridge:
                 raise ValueError("Missing discord.token in config")
             if 'channels' not in config['discord']:
                 raise ValueError("Missing discord.channels in config")
+            
+            # Validate at least one channel is configured
+            channels = config['discord']['channels']
+            if not channels:
+                raise ValueError("No Discord channels configured")
+                
+            # Recommend having dm and info channels
+            if 'dm' not in channels:
+                print("Warning: No 'dm' channel configured - DMs won't be displayed")
+            if 'info' not in channels:
+                print("Warning: No 'info' channel configured - mesh info won't be displayed")
                 
             return config
             
@@ -113,6 +124,18 @@ class MeshCoreDiscordBridge:
             else:
                 self.logger.error("Discord bot failed to connect (timeout)")
                 return
+            
+            # Log channel routing
+            self.logger.info("Channel routing configured:")
+            channels = discord_config['channels']
+            if 'dm' in channels:
+                self.logger.info("  - Direct Messages → #dm")
+            for key in sorted(channels.keys()):
+                if key.startswith('channel_'):
+                    channel_num = key.split('_')[1]
+                    self.logger.info(f"  - MeshCore Channel {channel_num} → #{key}")
+            if 'info' in channels:
+                self.logger.info("  - Mesh Info → #info")
                 
             # Initialize decoder
             self.logger.info("Initializing decoder...")
@@ -203,7 +226,14 @@ class MeshCoreDiscordBridge:
                     self.logger.info(f"  Adverts: {decoder_stats['adverts']}")
                     self.logger.info(f"  Contacts: {len(self.decoder.contacts)}")
                     self.logger.info(f"  Discord events: {discord_stats['events_received']}")
-                    self.logger.info(f"  Discord messages: {discord_stats['messages_sent']}")
+                    self.logger.info(f"  Discord messages sent: {discord_stats['messages_sent']}")
+                    
+                    # Per-channel stats
+                    if 'by_channel' in discord_stats:
+                        self.logger.info("  By channel:")
+                        for channel, count in sorted(discord_stats['by_channel'].items()):
+                            self.logger.info(f"    - {channel}: {count}")
+                    
                     self.logger.info(f"  Errors: {discord_stats['errors']}")
                     self.logger.info("=" * 60)
                     

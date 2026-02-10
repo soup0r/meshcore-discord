@@ -97,8 +97,10 @@ class MeshCoreConnection:
         await asyncio.sleep(0.3)
         
         # Get contacts for name resolution
+        logger.info("Loading contacts...")
         await self.send_frame(4)  # CMD_GET_CONTACTS
-        await asyncio.sleep(0.5)
+        # Note: finalize_initial_contacts() is called when END_CONTACTS (0x04) is received
+        await asyncio.sleep(1.0)  # Give time for contacts to load
         
         # Sync messages - try multiple times
         logger.info("Requesting messages from network...")

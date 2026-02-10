@@ -24,6 +24,8 @@ class EventType(Enum):
     RAW_DATA = "raw_data"
     TRACE = "trace"
     MESSAGE_WAITING = "message_waiting"
+    BRIDGE_CONNECTED = "bridge_connected"
+    CONTACT_SUMMARY = "contact_summary"
 
 
 @dataclass
@@ -65,6 +67,8 @@ class MeshCoreDecoder:
     def __init__(self, event_callback: Callable[[MeshEvent], None]):
         self.event_callback = event_callback
         self.contacts: Dict[str, str] = {}  # pubkey -> name mapping
+        self.initial_contact_loading = True  # Flag for startup contact loading
+        self.initial_contacts = []  # Track contacts during initial load
         self.stats = {
             'frames': 0,
             'messages': 0,
@@ -105,19 +109,19 @@ class MeshCoreDecoder:
             event = self._decode_advertisement(frame)
         elif code == 0x03:  # Contact
             event = self._decode_contact(frame)
+        elif code == 0x04:  # END_CONTACTS - finalize initial loading
+            logger.info("END_CONTACTS received - finalizing initial contact load")
+            self.finalize_initial_contacts()
+            return  # Don't emit event for END_CONTACTS
         elif code == 0x82:  # ACK
             event = self._decode_ack(frame)
         elif code == 0x84:  # Raw data
             event = self._decode_raw_data(frame)
         elif code == 0x89:  # Trace
             event = self._decode_trace(frame)
-        elif code == 0x83:  # Message waiting
-            event = MeshEvent(
-                type=EventType.MESSAGE_WAITING,
-                timestamp=datetime.now(),
-                data={},
-                raw_frame=frame
-            )
+        elif code == 0x83:  # Message waiting - just log, don't emit event
+            logger.debug("Message waiting signal received (0x83)")
+            return  # Don't emit event
             
         # Emit event if decoded
         if event and self.event_callback:
@@ -169,7 +173,7 @@ class MeshCoreDecoder:
                 'sender': sender,
                 'message': message,
                 'channel': channel,
-                'hops': hops,  # Use actual hop count
+                'hops': hops,
                 'timestamp': timestamp
             },
             raw_frame=frame
@@ -185,6 +189,7 @@ class MeshCoreDecoder:
         
         # Format: 0x10 + counter(3) + sender_key(6) + flags(2) + timestamp(4) + text
         sender_key = frame[4:10].hex()
+        hops = frame[10] if frame[10] != 0xFF else 0  # First flag byte - hop count
         timestamp_bytes = frame[12:16] if len(frame) >= 16 else b'\x00\x00\x00\x00'
         timestamp = struct.unpack('<I', timestamp_bytes)[0]
         text = frame[16:].decode('utf-8', errors='ignore') if len(frame) > 16 else ""
@@ -192,16 +197,16 @@ class MeshCoreDecoder:
         # Look up sender name
         sender = self.contacts.get(sender_key[:12], sender_key[:8] + '...')
         
-        logger.info(f"0x10 DM: from={sender} ({sender_key[:12]}), text='{text}'")
+        logger.info(f"0x10 DM: from={sender} ({sender_key[:12]}), hops={hops}, text='{text}'")
         
         return MeshEvent(
-            type=EventType.DIRECT_MESSAGE,  # Changed from CHANNEL_MESSAGE
+            type=EventType.DIRECT_MESSAGE,
             timestamp=datetime.now(),
             data={
                 'sender': sender,
                 'message': text,
                 'channel': 0,
-                'hops': 0,
+                'hops': hops,
                 'timestamp': timestamp
             },
             raw_frame=frame
@@ -367,7 +372,18 @@ class MeshCoreDecoder:
         # Cache contact
         self.contacts[pubkey[:12]] = name
         
-        logger.info(f"Contact discovered: {name} ({type_str})")
+        # If we're in initial loading mode, cache silently
+        if self.initial_contact_loading:
+            self.initial_contacts.append({
+                'name': name,
+                'type': type_str,
+                'pubkey': pubkey
+            })
+            logger.debug(f"Cached contact: {name} ({type_str})")
+            return None  # Don't emit event during initial load
+        
+        # After initial load, emit events for new contacts
+        logger.info(f"New contact discovered: {name} ({type_str})")
         
         return MeshEvent(
             type=EventType.CONTACT,
@@ -419,10 +435,115 @@ class MeshCoreDecoder:
         )
         
     def _decode_trace(self, frame: bytes) -> Optional[MeshEvent]:
-        """Decode 0x89 trace packet"""
+        """Decode 0x89 trace packet with full path and SNR information
+        
+        Format (PUSH_CODE_TRACE_DATA):
+        - Byte 0: 0x89 (code)
+        - Byte 1: reserved (0)
+        - Byte 2: path_len
+        - Byte 3: flags
+        - Bytes 4-7: tag (32-bit LE)
+        - Bytes 8-11: auth_code (32-bit LE)
+        - Bytes 12+: path_hashes (path_len bytes)
+        - After path_hashes: path_snrs (path_len+1 bytes, each = SNR*4)
+        """
+        if len(frame) < 12:
+            # Too short for minimal trace packet
+            return MeshEvent(
+                type=EventType.TRACE,
+                timestamp=datetime.now(),
+                data={'hex': frame.hex(), 'error': 'packet too short'},
+                raw_frame=frame
+            )
+        
+        try:
+            reserved = frame[1]
+            path_len = frame[2]
+            flags = frame[3]
+            tag = struct.unpack('<i', frame[4:8])[0]  # signed 32-bit
+            auth_code = struct.unpack('<i', frame[8:12])[0]  # signed 32-bit
+            
+            # Calculate expected frame length
+            expected_len = 12 + path_len + (path_len + 1)
+            
+            if len(frame) < expected_len:
+                logger.warning(f"Trace packet shorter than expected: {len(frame)} < {expected_len}")
+            
+            # Extract path hashes
+            path_hashes = []
+            if len(frame) >= 12 + path_len:
+                for i in range(path_len):
+                    hash_byte = frame[12 + i]
+                    path_hashes.append(f"{hash_byte:02x}")
+            
+            # Extract SNR values
+            path_snrs = []
+            snr_start = 12 + path_len
+            if len(frame) >= snr_start + (path_len + 1):
+                for i in range(path_len + 1):
+                    snr_byte = struct.unpack('b', bytes([frame[snr_start + i]]))[0]  # signed byte
+                    snr_db = snr_byte / 4.0
+                    path_snrs.append(snr_db)
+            
+            data = {
+                'hex': frame.hex(),
+                'path_len': path_len,
+                'flags': flags,
+                'tag': tag,
+                'auth_code': auth_code,
+                'path_hashes': path_hashes,
+                'path_snrs': path_snrs
+            }
+            
+            logger.info(f"Trace packet decoded: path_len={path_len}, hops={len(path_snrs)-1}, avg_snr={sum(path_snrs)/len(path_snrs) if path_snrs else 0:.1f}dB")
+            
+        except Exception as e:
+            logger.error(f"Error decoding trace packet: {e}")
+            data = {
+                'hex': frame.hex(),
+                'error': str(e)
+            }
+        
         return MeshEvent(
             type=EventType.TRACE,
             timestamp=datetime.now(),
-            data={'hex': frame.hex()},
+            data=data,
             raw_frame=frame
         )
+    
+    def finalize_initial_contacts(self):
+        """End initial contact loading and emit summary event"""
+        if not self.initial_contact_loading:
+            logger.debug("finalize_initial_contacts called but already finalized")
+            return  # Already finalized
+        
+        self.initial_contact_loading = False
+        
+        # Count by type
+        type_counts = {}
+        for contact in self.initial_contacts:
+            node_type = contact['type']
+            type_counts[node_type] = type_counts.get(node_type, 0) + 1
+        
+        total = len(self.initial_contacts)
+        logger.info(f"Initial contact loading complete: {total} contacts cached")
+        
+        # Emit summary event
+        if self.event_callback:
+            event = MeshEvent(
+                type=EventType.CONTACT_SUMMARY,
+                timestamp=datetime.now(),
+                data={
+                    'total': total,
+                    'by_type': type_counts,
+                    'contacts': self.initial_contacts
+                },
+                raw_frame=b''
+            )
+            try:
+                self.event_callback(event)
+            except Exception as e:
+                logger.error(f"Error emitting contact summary: {e}", exc_info=True)
+        
+        # Clear initial contacts list to free memory
+        self.initial_contacts = []

@@ -8,7 +8,7 @@ import discord
 import logging
 from typing import Dict, List
 from datetime import datetime
-from collections import deque
+from collections import deque, defaultdict
 
 from meshcore_decoder import MeshEvent, EventType
 
@@ -44,8 +44,9 @@ class DiscordBridge(discord.Client):
         self.batch_interval = batch_interval
         self.max_batch_size = max_batch_size
         
-        # Message queues for batching
-        self.message_queue: deque = deque()
+        # Message queues for batching - one per channel type
+        self.dm_queue: deque = deque()
+        self.channel_queues: Dict[int, deque] = defaultdict(deque)  # MeshCore channel# -> queue
         self.info_queue: deque = deque()
         
         # Channel cache
@@ -55,7 +56,8 @@ class DiscordBridge(discord.Client):
         self.stats = {
             'events_received': 0,
             'messages_sent': 0,
-            'errors': 0
+            'errors': 0,
+            'by_channel': defaultdict(int)
         }
         
     async def on_ready(self):
@@ -88,20 +90,38 @@ class DiscordBridge(discord.Client):
         
         try:
             # Route to appropriate channel
-            if event.type in [EventType.CHANNEL_MESSAGE, EventType.DIRECT_MESSAGE]:
-                if event.type == EventType.DIRECT_MESSAGE:
-                    logger.info(f"!!! ROUTING DM TO #meshcore-messages !!! From: {event.data.get('sender')}")
-                else:
-                    logger.info(f"!!! ROUTING CHANNEL MESSAGE TO #meshcore-messages !!! Ch#{event.data.get('channel')} From: {event.data.get('sender')}")
+            if event.type == EventType.DIRECT_MESSAGE:
+                # DMs go to dm channel
+                logger.info(f"!!! ROUTING DM TO #dm !!! From: {event.data.get('sender')}")
                 logger.debug(f"Message data: {event.data}")
                 embed = self._create_message_embed(event)
-                self.message_queue.append(embed)
-                logger.debug(f"Message queue size: {len(self.message_queue)}")
+                self.dm_queue.append(embed)
+                self.stats['by_channel']['dm'] += 1
+                logger.debug(f"DM queue size: {len(self.dm_queue)}")
+                
+            elif event.type == EventType.CHANNEL_MESSAGE:
+                # Channel messages go to their specific channel
+                channel_num = event.data.get('channel', 0)
+                channel_key = f"channel_{channel_num}"
+                logger.info(f"!!! ROUTING CHANNEL MESSAGE TO #{channel_key} !!! Ch#{channel_num} From: {event.data.get('sender')}")
+                logger.debug(f"Message data: {event.data}")
+                embed = self._create_message_embed(event)
+                self.channel_queues[channel_num].append(embed)
+                self.stats['by_channel'][channel_key] += 1
+                logger.debug(f"Channel {channel_num} queue size: {len(self.channel_queues[channel_num])}")
+            
+            elif event.type == EventType.CONTACT_SUMMARY:
+                # Contact summary goes to info channel
+                logger.info("!!! ROUTING CONTACT SUMMARY TO #info !!!")
+                embed = self._create_contact_summary_embed(event)
+                self.info_queue.append(embed)
+                self.stats['by_channel']['info'] += 1
                 
             else:
                 # Everything else goes to info channel
                 embed = self._create_info_embed(event)
                 self.info_queue.append(embed)
+                self.stats['by_channel']['info'] += 1
                 
         except Exception as e:
             logger.error(f"Error handling event: {e}", exc_info=True)
@@ -138,6 +158,40 @@ class DiscordBridge(discord.Client):
             # No channel field for DMs
             
         return embed
+    
+    def _create_contact_summary_embed(self, event: MeshEvent) -> discord.Embed:
+        """Create embed for contact summary"""
+        data = event.data
+        total = data.get('total', 0)
+        by_type = data.get('by_type', {})
+        
+        embed = discord.Embed(
+            title="🔄 Bridge Connected & Initialized",
+            description=f"Successfully connected to MeshCore node and loaded **{total} contacts**",
+            color=discord.Color.green(),
+            timestamp=event.timestamp
+        )
+        
+        # Add breakdown by type
+        if by_type:
+            type_breakdown = []
+            for node_type, count in sorted(by_type.items()):
+                emoji = {
+                    'CHAT': '💬',
+                    'REPEATER': '📡',
+                    'ROOM': '🏠'
+                }.get(node_type, '❓')
+                type_breakdown.append(f"{emoji} {node_type}: {count}")
+            
+            embed.add_field(
+                name="Contact Breakdown",
+                value='\n'.join(type_breakdown),
+                inline=False
+            )
+        
+        embed.set_footer(text="All contacts cached for name resolution • Monitoring for new contacts")
+        
+        return embed
         
     def _create_info_embed(self, event: MeshEvent) -> discord.Embed:
         """Create embed for info events"""
@@ -157,9 +211,10 @@ class DiscordBridge(discord.Client):
             embed.add_field(name="Type", value=data.get('subtype', 'Unknown'), inline=True)
             
             if 'pubkey' in data:
+                # Show full public key
                 embed.add_field(
                     name="Key",
-                    value=f"`{data['pubkey'][:16]}...`",
+                    value=f"`{data['pubkey']}`",
                     inline=False
                 )
                 
@@ -170,7 +225,7 @@ class DiscordBridge(discord.Client):
                 timestamp=event.timestamp
             )
             embed.add_field(name="Node", value=data['name'], inline=True)
-            embed.add_field(name="Key", value=f"`{data['pubkey'][:16]}...`", inline=False)
+            embed.add_field(name="Key", value=f"`{data['pubkey']}`", inline=False)
             
         elif event.type == EventType.CONTACT:
             embed = discord.Embed(
@@ -180,7 +235,7 @@ class DiscordBridge(discord.Client):
             )
             embed.add_field(name="Name", value=data['name'], inline=True)
             embed.add_field(name="Type", value=data['node_type'], inline=True)
-            embed.add_field(name="Key", value=f"`{data['pubkey'][:16]}...`", inline=False)
+            embed.add_field(name="Key", value=f"`{data['pubkey']}`", inline=False)
             
         elif event.type == EventType.ACK:
             embed = discord.Embed(
@@ -201,12 +256,85 @@ class DiscordBridge(discord.Client):
             embed.add_field(name="RSSI", value=f"{data['rssi_dbm']} dBm", inline=True)
             
         elif event.type == EventType.TRACE:
-            embed = discord.Embed(
-                title="🔄 Trace Packet",
-                description=f"`{data['hex'][:50]}...`",
-                color=discord.Color.dark_gray(),
-                timestamp=event.timestamp
-            )
+            # Show decoded trace information if available
+            if 'error' in data:
+                embed = discord.Embed(
+                    title="🔍 Trace Packet (Error)",
+                    description=f"Error: {data['error']}",
+                    color=discord.Color.red(),
+                    timestamp=event.timestamp
+                )
+                embed.add_field(name="Raw Hex", value=f"`{data['hex'][:100]}...`", inline=False)
+            elif 'path_len' in data:
+                # Decoded trace packet
+                path_len = data['path_len']
+                hops = len(data.get('path_snrs', [])) - 1  # -1 because last SNR is to destination
+                
+                embed = discord.Embed(
+                    title="🔍 Trace Packet",
+                    description=f"Network path trace completed with **{hops} hops**",
+                    color=discord.Color.teal(),
+                    timestamp=event.timestamp
+                )
+                
+                # Tag and auth code
+                embed.add_field(name="Tag", value=f"`{data['tag']}`", inline=True)
+                embed.add_field(name="Auth Code", value=f"`{data['auth_code']}`", inline=True)
+                embed.add_field(name="Path Length", value=str(path_len), inline=True)
+                
+                # Path hashes
+                if data.get('path_hashes'):
+                    path_str = " → ".join(data['path_hashes'])
+                    if len(path_str) > 1000:
+                        path_str = path_str[:1000] + "..."
+                    embed.add_field(
+                        name="Path Hashes",
+                        value=f"`{path_str}`",
+                        inline=False
+                    )
+                
+                # SNR values with visual indicators
+                if data.get('path_snrs'):
+                    snr_strs = []
+                    for i, snr in enumerate(data['path_snrs']):
+                        # Add visual indicator based on SNR quality
+                        if snr >= 10:
+                            indicator = "🟢"  # Excellent
+                        elif snr >= 5:
+                            indicator = "🟡"  # Good
+                        elif snr >= 0:
+                            indicator = "🟠"  # Fair
+                        else:
+                            indicator = "🔴"  # Poor
+                        
+                        hop_label = f"Hop {i}" if i < len(data['path_snrs']) - 1 else "Final"
+                        snr_strs.append(f"{indicator} {hop_label}: {snr:.1f} dB")
+                    
+                    embed.add_field(
+                        name="Signal Quality (SNR)",
+                        value="\n".join(snr_strs),
+                        inline=False
+                    )
+                    
+                    # Calculate average SNR
+                    avg_snr = sum(data['path_snrs']) / len(data['path_snrs'])
+                    embed.set_footer(text=f"Average SNR: {avg_snr:.1f} dB")
+                
+                # Show hex for reference
+                if len(data['hex']) > 100:
+                    embed.add_field(
+                        name="Raw Hex",
+                        value=f"`{data['hex'][:100]}...` ({len(data['hex'])//2} bytes)",
+                        inline=False
+                    )
+            else:
+                # Fallback for unparsed trace
+                embed = discord.Embed(
+                    title="🔍 Trace Packet",
+                    description=f"`{data.get('hex', '')}...`" if len(data.get('hex', '')) > 50 else f"`{data.get('hex', '')}`",
+                    color=discord.Color.dark_gray(),
+                    timestamp=event.timestamp
+                )
             
         else:
             # Generic fallback
@@ -227,13 +355,23 @@ class DiscordBridge(discord.Client):
             try:
                 await asyncio.sleep(self.batch_interval)
                 
-                # Send message queue
-                if self.message_queue and 'messages' in self.channels:
-                    logger.info(f"Sending {len(self.message_queue)} messages to #meshcore-messages")
+                # Send DM queue
+                if self.dm_queue and 'dm' in self.channels:
+                    logger.info(f"Sending {len(self.dm_queue)} messages to #dm")
                     await self._send_batch(
-                        self.message_queue,
-                        self.channels['messages']
+                        self.dm_queue,
+                        self.channels['dm']
                     )
+                
+                # Send each channel queue
+                for channel_num, queue in self.channel_queues.items():
+                    channel_key = f"channel_{channel_num}"
+                    if queue and channel_key in self.channels:
+                        logger.info(f"Sending {len(queue)} messages to #{channel_key}")
+                        await self._send_batch(
+                            queue,
+                            self.channels[channel_key]
+                        )
                     
                 # Send info queue
                 if self.info_queue and 'info' in self.channels:
@@ -290,6 +428,7 @@ class DiscordBridge(discord.Client):
         """Get bridge statistics"""
         return {
             **self.stats,
-            'message_queue_size': len(self.message_queue),
+            'dm_queue_size': len(self.dm_queue),
+            'channel_queue_sizes': {f'channel_{k}': len(v) for k, v in self.channel_queues.items()},
             'info_queue_size': len(self.info_queue)
         }
